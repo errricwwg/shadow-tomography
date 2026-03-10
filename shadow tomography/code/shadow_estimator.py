@@ -126,8 +126,14 @@ def main():
     K = len(measurements)
     print(f"\nLoaded {K} measurements from measurement_data.txt.")
 
-    # --- Run estimator ---
+    # --- Run estimator for H ---
     sigmas, values, mean_val, std_val, sem_val = run_estimator(measurements, H)
+
+    # --- Run estimator for each Pauli separately ---
+    pauli_results = {}
+    for name, P in PAULIS.items():
+        _, _, p_mean, p_std, p_sem = run_estimator(measurements, P)
+        pauli_results[name] = (p_mean, p_std, p_sem)
 
     # --- Output results ---
     print(f"\n{'='*60}")
@@ -147,6 +153,13 @@ def main():
     print(f"  Std deviation  = {std_val:.6f}  (spread of individual shots, converges to a constant)")
     print(f"  Std error(SEM) = {sem_val:.6f}  (uncertainty in the mean, shrinks as 1/sqrt(K))")
     print(f"  Exact <H|0>    = Tr(rho H) = c = {c:.6f}  (for verification)")
+    print(f"{'='*60}")
+
+    print(f"\n--- Individual Pauli estimates ---")
+    print(f"  {'Observable':<12} {'Estimate':>12} {'Std dev':>12} {'SEM':>12}")
+    print(f"  {'-'*50}")
+    for name, (p_mean, p_std, p_sem) in pauli_results.items():
+        print(f"  <{name}>          {p_mean:>12.6f} {p_std:>12.6f} {p_sem:>12.6f}")
     print(f"{'='*60}")
 
 
