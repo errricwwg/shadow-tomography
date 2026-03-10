@@ -98,7 +98,9 @@ def run_estimator(measurements: list[tuple[str, int]], H: np.ndarray):
         values.append(val)
 
     values_arr = np.array(values)
-    return sigmas, values, float(np.mean(values_arr)), float(np.std(values_arr, ddof=0))
+    std = float(np.std(values_arr, ddof=1))
+    sem = std / np.sqrt(len(values_arr))
+    return sigmas, values, float(np.mean(values_arr)), std, sem
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +127,7 @@ def main():
     print(f"\nLoaded {K} measurements from measurement_data.txt.")
 
     # --- Run estimator ---
-    sigmas, values, mean_val, std_val = run_estimator(measurements, H)
+    sigmas, values, mean_val, std_val, sem_val = run_estimator(measurements, H)
 
     # --- Output results ---
     print(f"\n{'='*60}")
@@ -142,7 +144,8 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"  Estimated <H>  = (1/K) sum_k value_k = {mean_val:.6f}")
-    print(f"  Std deviation  = {std_val:.6f}")
+    print(f"  Std deviation  = {std_val:.6f}  (spread of individual shots, converges to a constant)")
+    print(f"  Std error(SEM) = {sem_val:.6f}  (uncertainty in the mean, shrinks as 1/sqrt(K))")
     print(f"  Exact <H|0>    = Tr(rho H) = c = {c:.6f}  (for verification)")
     print(f"{'='*60}")
 
