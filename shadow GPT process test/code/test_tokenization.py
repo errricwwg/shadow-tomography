@@ -412,16 +412,11 @@ class TestValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             tok.tokenize_measurement(m)
 
-    def test_clifford_collector_raises_clearly(self):
-        """
-        Known limitation: clifford-mode data (basis values 0-23) is not
-        supported by the tokenizer.  Verify the error is a clear ValueError,
-        not a silent UNK or crash.
-        """
+    def test_pauli_tokenizer_rejects_clifford_basis_values(self):
+        """A Pauli-mode tokenizer (no measurement_mode) must raise ValueError
+        when fed clifford basis values (> 2)."""
         from shadows.config import create_clifford_config
-        config = create_clifford_config(n_qubits=self.n, n_shadows=2)
-        collector = ShadowCollector(config)
-        # Build a fake clifford measurement with a non-Pauli basis value
+        collector = ShadowCollector(create_clifford_config(n_qubits=self.n, n_shadows=2))
         collector.measurements = [
             ShadowMeasurement(
                 basis=np.array([3, 7, 15]),   # Clifford indices 0-23
@@ -431,6 +426,18 @@ class TestValidation(unittest.TestCase):
         tok = create_default_tokenizer(self.n, token_type="basis_outcome")
         with self.assertRaises(ValueError):
             tok.tokenize_collector(collector)
+
+    def test_pauli_string_rejects_clifford_measurement_mode_at_init(self):
+        """pauli_string mode must raise at construction if measurement_mode=clifford."""
+        with self.assertRaises(ValueError):
+            create_default_tokenizer(self.n, token_type="pauli_string",
+                                     measurement_mode="clifford")
+
+    def test_pauli_string_rejects_custom_measurement_mode_at_init(self):
+        """pauli_string mode must raise at construction if measurement_mode=custom."""
+        with self.assertRaises(ValueError):
+            create_default_tokenizer(self.n, token_type="pauli_string",
+                                     measurement_mode="custom")
 
     def test_2d_basis_raises(self):
         m = ShadowMeasurement(
@@ -503,6 +510,240 @@ class TestSaveLoad(unittest.TestCase):
         seqs_orig = orig.create_sequences([ids_before])
         seqs_loaded = loaded.create_sequences([ids_before])
         self.assertEqual(seqs_orig, seqs_loaded)
+
+
+# ---------------------------------------------------------------------------
+# F. Clifford measurement mode
+# ---------------------------------------------------------------------------
+
+class TestCliffordModeTokenization(unittest.TestCase):
+    """Tests for tokenization of clifford-mode measurements (basis values 0–23)."""
+
+    def setUp(self):
+        _skip_if_unavailable(self)
+        self.n = 4
+        # Clifford measurements: basis values drawn from 0–23
+        self.m = ShadowMeasurement(
+            basis=np.array([0, 5, 12, 23]),
+            outcome=np.array([0, 1, 0, 1]),
+        )
+
+    # ── basis_outcome ─────────────────────────────────────────────────────────
+
+    def test_clifford_basis_outcome_no_unk(self):
+        tok = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                       measurement_mode="clifford")
+        unk = tok.special_tokens["UNK"]
+        ids = tok.tokenize_measurement(self.m)
+        self.assertNotIn(unk, ids)
+
+    def test_clifford_basis_outcome_length(self):
+        tok = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                       measurement_mode="clifford")
+        ids = tok.tokenize_measurement(self.m)
+        self.assertEqual(len(ids), self.n)
+
+    def test_clifford_basis_outcome_vocab_size(self):
+        # 4 special + 24 bases * 2 outcomes = 4 + 48 = 52
+        tok = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                       measurement_mode="clifford")
+        self.assertEqual(tok.get_vocab_size(), 52)
+
+    def test_clifford_basis_outcome_spot_check(self):
+        """basis=5,outcome=1 → token 'B5O1' is in vocab and returned."""
+        tok = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                       measurement_mode="clifford")
+        self.assertIn("B5O1", tok.vocab)
+        ids = tok.tokenize_measurement(self.m)
+        self.assertEqual(ids[1], tok.vocab["B5O1"])   # qubit 1: basis=5, outcome=1
+        self.assertEqual(ids[3], tok.vocab["B23O1"])  # qubit 3: basis=23, outcome=1
+
+    def test_clifford_basis_outcome_all_24_bases_in_vocab(self):
+        tok = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                       measurement_mode="clifford")
+        for b in range(24):
+            for o in range(2):
+                self.assertIn(f"B{b}O{o}", tok.vocab)
+
+    def test_clifford_basis_outcome_rejects_out_of_range(self):
+        tok = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                       measurement_mode="clifford")
+        m_bad = ShadowMeasurement(
+            basis=np.array([0, 24, 0, 0]),  # 24 is out of range for clifford
+            outcome=np.array([0, 0, 0, 0]),
+        )
+        with self.assertRaises(ValueError):
+            tok.tokenize_measurement(m_bad)
+
+    # ── binary ────────────────────────────────────────────────────────────────
+
+    def test_clifford_binary_length(self):
+        """5 basis bits + 1 outcome bit = 6 chars per qubit."""
+        tok = create_default_tokenizer(self.n, token_type="binary",
+                                       measurement_mode="clifford")
+        ids = tok.tokenize_measurement(self.m)
+        self.assertEqual(len(ids), 6 * self.n)
+
+    def test_clifford_binary_no_unk(self):
+        tok = create_default_tokenizer(self.n, token_type="binary",
+                                       measurement_mode="clifford")
+        unk = tok.special_tokens["UNK"]
+        ids = tok.tokenize_measurement(self.m)
+        self.assertNotIn(unk, ids)
+
+    def test_clifford_binary_only_zero_and_one(self):
+        tok = create_default_tokenizer(self.n, token_type="binary",
+                                       measurement_mode="clifford")
+        ids = tok.tokenize_measurement(self.m)
+        chars = {tok.reverse_vocab[tid] for tid in ids}
+        self.assertEqual(chars, {"0", "1"})
+
+    def test_clifford_binary_spot_check(self):
+        """
+        basis=5 → binary 00101 (5 bits), outcome=1 → '001011'
+        basis=23 → binary 10111 (5 bits), outcome=1 → '101111'
+        """
+        tok = create_default_tokenizer(self.n, token_type="binary",
+                                       measurement_mode="clifford")
+        ids = tok.tokenize_measurement(self.m)
+        v0, v1 = tok.vocab["0"], tok.vocab["1"]
+        # qubit 1: basis=5 (00101), outcome=1 → '001011'
+        expected_q1 = [v0, v0, v1, v0, v1, v1]
+        self.assertEqual(ids[6:12], expected_q1)
+        # qubit 3: basis=23 (10111), outcome=1 → '101111'
+        expected_q3 = [v1, v0, v1, v1, v1, v1]
+        self.assertEqual(ids[18:24], expected_q3)
+
+    def test_clifford_binary_seq_length_in_factory(self):
+        """create_default_tokenizer sets max_seq_len = 6*n + 2 for clifford binary."""
+        tok = create_default_tokenizer(self.n, token_type="binary",
+                                       measurement_mode="clifford")
+        self.assertEqual(tok.config.max_sequence_length, 6 * self.n + 2)
+
+    def test_clifford_basis_outcome_seq_length_in_factory(self):
+        """create_default_tokenizer sets max_seq_len = n + 2 for clifford basis_outcome."""
+        tok = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                       measurement_mode="clifford")
+        self.assertEqual(tok.config.max_sequence_length, self.n + 2)
+
+    # ── pauli_string rejection ────────────────────────────────────────────────
+
+    def test_clifford_rejects_pauli_string_at_init(self):
+        """Clifford mode is incompatible with pauli_string — must fail at init."""
+        with self.assertRaises(ValueError):
+            create_default_tokenizer(self.n, token_type="pauli_string",
+                                     measurement_mode="clifford")
+
+    # ── save/load ─────────────────────────────────────────────────────────────
+
+    def test_clifford_save_load_round_trip(self):
+        import tempfile
+        tok = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                       measurement_mode="clifford")
+        ids_before = tok.tokenize_measurement(self.m)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        tok.save_tokenizer(path)
+        tok2 = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                        measurement_mode="clifford")
+        tok2.load_tokenizer(path)
+        self.assertEqual(tok2.tokenize_measurement(self.m), ids_before)
+
+
+# ---------------------------------------------------------------------------
+# G. Custom measurement mode
+# ---------------------------------------------------------------------------
+
+class TestCustomModeTokenization(unittest.TestCase):
+    """Tests for tokenization of custom-mode measurements (user-defined basis labels)."""
+
+    def setUp(self):
+        _skip_if_unavailable(self)
+        self.n = 3
+        self.max_basis = 5   # 6 distinct basis values: 0–5
+        # Measurement using custom basis labels 0–5
+        self.m = ShadowMeasurement(
+            basis=np.array([0, 3, 5]),
+            outcome=np.array([1, 0, 1]),
+        )
+
+    def test_custom_basis_outcome_vocab_size(self):
+        # 4 special + 6 bases * 2 outcomes = 4 + 12 = 16
+        tok = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                       measurement_mode="custom",
+                                       max_basis_value=self.max_basis)
+        self.assertEqual(tok.get_vocab_size(), 16)
+
+    def test_custom_basis_outcome_no_unk(self):
+        tok = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                       measurement_mode="custom",
+                                       max_basis_value=self.max_basis)
+        unk = tok.special_tokens["UNK"]
+        ids = tok.tokenize_measurement(self.m)
+        self.assertNotIn(unk, ids)
+
+    def test_custom_basis_outcome_length(self):
+        tok = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                       measurement_mode="custom",
+                                       max_basis_value=self.max_basis)
+        ids = tok.tokenize_measurement(self.m)
+        self.assertEqual(len(ids), self.n)
+
+    def test_custom_basis_outcome_spot_check(self):
+        tok = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                       measurement_mode="custom",
+                                       max_basis_value=self.max_basis)
+        ids = tok.tokenize_measurement(self.m)
+        self.assertEqual(ids[1], tok.vocab["B3O0"])  # qubit 1: basis=3, outcome=0
+        self.assertEqual(ids[2], tok.vocab["B5O1"])  # qubit 2: basis=5, outcome=1
+
+    def test_custom_basis_outcome_rejects_above_max(self):
+        tok = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                       measurement_mode="custom",
+                                       max_basis_value=self.max_basis)
+        m_bad = ShadowMeasurement(
+            basis=np.array([0, 6, 0]),  # 6 > max_basis_value=5
+            outcome=np.array([0, 0, 0]),
+        )
+        with self.assertRaises(ValueError):
+            tok.tokenize_measurement(m_bad)
+
+    def test_custom_binary_length(self):
+        # max_basis_value=5 → 6 bases → ceil(log2(6))=3 bits for basis + 1 outcome = 4 per qubit
+        tok = create_default_tokenizer(self.n, token_type="binary",
+                                       measurement_mode="custom",
+                                       max_basis_value=self.max_basis)
+        ids = tok.tokenize_measurement(self.m)
+        self.assertEqual(len(ids), 4 * self.n)
+
+    def test_custom_binary_no_unk(self):
+        tok = create_default_tokenizer(self.n, token_type="binary",
+                                       measurement_mode="custom",
+                                       max_basis_value=self.max_basis)
+        unk = tok.special_tokens["UNK"]
+        ids = tok.tokenize_measurement(self.m)
+        self.assertNotIn(unk, ids)
+
+    def test_custom_rejects_pauli_string_at_init(self):
+        with self.assertRaises(ValueError):
+            create_default_tokenizer(self.n, token_type="pauli_string",
+                                     measurement_mode="custom",
+                                     max_basis_value=self.max_basis)
+
+    def test_custom_seq_length_in_factory_binary(self):
+        # 6 bases → 3 basis bits + 1 outcome bit = 4 per qubit; +2 for BOS/EOS
+        tok = create_default_tokenizer(self.n, token_type="binary",
+                                       measurement_mode="custom",
+                                       max_basis_value=self.max_basis)
+        self.assertEqual(tok.config.max_sequence_length, 4 * self.n + 2)
+
+    def test_custom_all_basis_values_in_vocab(self):
+        tok = create_default_tokenizer(self.n, token_type="basis_outcome",
+                                       measurement_mode="custom",
+                                       max_basis_value=self.max_basis)
+        for b in range(self.max_basis + 1):
+            for o in range(2):
+                self.assertIn(f"B{b}O{o}", tok.vocab)
 
 
 # ---------------------------------------------------------------------------

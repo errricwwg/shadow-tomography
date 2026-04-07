@@ -2,33 +2,45 @@
 Tokenization for classical shadow data to prepare for language model training.
 
 This module provides the ShadowTokenizer class for converting classical shadow
-measurements into token sequences suitable for training GPT-style transformers.
+measurements into token sequences suitable for training transformer models.
+
+Supported measurement modes
+---------------------------
+pauli / random
+    Basis values 0=X, 1=Y, 2=Z.
+clifford
+    Basis values 0–23 (indices into the 24 single-qubit Clifford gates).
+custom
+    User-defined integer basis labels 0 … max_basis_value.
 
 Tokenization modes
 ------------------
 basis_outcome
     One token per qubit, encoding the (basis, outcome) pair.
-    Basis is 0=X / 1=Y / 2=Z; outcome is 0 or 1.
-    Vocabulary: B0O0, B0O1, B1O0, B1O1, B2O0, B2O1  (6 content tokens).
+    Token format: ``B{basis}O{outcome}``.
+    Pauli: 6 content tokens (B0O0 … B2O1).
+    Clifford: 48 content tokens (B0O0 … B23O1).
+    Custom (max_basis_value=N): 2*(N+1) content tokens.
     Sequence length per measurement: n_qubits.
 
 pauli_string
-    One token per qubit, encoding only the measurement basis as a Pauli
-    character ('X', 'Y', or 'Z').  Outcome information is intentionally
-    discarded — this mode captures only which basis was measured, not the
-    result.  Use basis_outcome if you need both.
-    Vocabulary: X, Y, Z  (3 content tokens).
+    One character token per qubit, encoding only the Pauli basis ('X', 'Y',
+    or 'Z').  **Pauli / random mode only** — clifford and custom measurements
+    carry no direct Pauli labelling and will raise ValueError.
+    Vocabulary: X, Y, Z (3 content tokens).
     Sequence length per measurement: n_qubits.
 
 binary
-    Character-level encoding of the full measurement: for each qubit,
-    2 bits encode the basis (00=X, 01=Y, 10=Z) and 1 bit encodes the
-    outcome, giving 3 characters per qubit.
-    Vocabulary: '0', '1'  (2 content tokens).
-    Sequence length per measurement: 3 * n_qubits.
+    Character-level bit encoding per qubit: ``ceil(log2(n_bases))`` bits for
+    the basis index followed by 1 bit for the outcome.
+    Pauli: 2 basis bits + 1 outcome bit = 3 chars/qubit.
+    Clifford: 5 basis bits + 1 outcome bit = 6 chars/qubit.
+    Vocabulary: '0', '1' (2 content tokens).
+    Sequence length per measurement: (basis_bits + 1) * n_qubits.
 """
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -54,6 +66,12 @@ class TokenizationConfig:
     special_tokens: Optional[Dict[str, int]] = None  # Override default BOS/EOS/PAD/UNK IDs
     padding_strategy: str = "right"         # "left" | "right" | "none"
     truncation_strategy: str = "right"      # "left" | "right" | "none"
+    # Measurement mode governs how many distinct basis values are expected.
+    # None / "pauli" / "random" → 3 bases (0=X,1=Y,2=Z)
+    # "clifford"                → 24 bases (0–23)
+    # "custom"                  → max_basis_value+1 bases (0 … max_basis_value)
+    measurement_mode: Optional[str] = None
+    max_basis_value: int = 23               # Only used when measurement_mode="custom"
 
 
 # ---------------------------------------------------------------------------
@@ -71,13 +89,16 @@ _DEFAULT_SPECIAL_TOKENS: Dict[str, int] = {
 
 _PAULI_MAP = {0: "X", 1: "Y", 2: "Z"}
 
+# Measurement modes that map cleanly to Pauli characters.
+_PAULI_MODES = {None, "pauli", "random"}
+
 
 class ShadowTokenizer:
     """
     Tokenizer for classical shadow measurements.
 
     Converts ShadowMeasurement objects into integer token sequences suitable
-    for training GPT-style language models.
+    for training transformer models.
     """
 
     def __init__(self, config: TokenizationConfig) -> None:
@@ -85,6 +106,16 @@ class ShadowTokenizer:
             raise ValueError(
                 f"Unknown token_type {config.token_type!r}. "
                 f"Must be one of: {sorted(_VALID_TOKEN_TYPES)}."
+            )
+        if (
+            config.token_type == "pauli_string"
+            and config.measurement_mode not in _PAULI_MODES
+        ):
+            raise ValueError(
+                f"pauli_string mode only supports pauli/random measurements "
+                f"(basis values 0=X, 1=Y, 2=Z), but measurement_mode="
+                f"{config.measurement_mode!r} was given. "
+                f"Use basis_outcome or binary for clifford/custom modes."
             )
 
         self.config = config
@@ -96,6 +127,25 @@ class ShadowTokenizer:
         self.reverse_vocab: Dict[int, str] = {}
 
         self._build_vocabulary()
+
+    # ------------------------------------------------------------------
+    # Helpers: basis count / bit width
+    # ------------------------------------------------------------------
+
+    def _basis_count(self) -> int:
+        """Return the number of distinct basis values for this tokenizer."""
+        mode = self.config.measurement_mode
+        if mode == "clifford":
+            return 24
+        if mode == "custom":
+            return self.config.max_basis_value + 1
+        # None / "pauli" / "random"
+        return 3
+
+    def _basis_bits(self) -> int:
+        """Return the number of bits needed to encode a basis index in binary mode."""
+        n = self._basis_count()
+        return max(1, math.ceil(math.log2(n))) if n > 1 else 1
 
     # ------------------------------------------------------------------
     # Vocabulary
@@ -110,8 +160,8 @@ class ShadowTokenizer:
         next_id = max(self.special_tokens.values()) + 1
 
         if self.config.token_type == "basis_outcome":
-            # 3 bases × 2 outcomes = 6 content tokens
-            for basis in range(3):
+            # n_bases × 2 outcomes content tokens
+            for basis in range(self._basis_count()):
                 for outcome in range(2):
                     token = f"B{basis}O{outcome}"
                     self.vocab[token] = next_id
@@ -140,9 +190,14 @@ class ShadowTokenizer:
         """
         Tokenize a single ShadowMeasurement into a list of token IDs.
 
-        Supported measurement modes: "random" and "pauli" (basis values 0=X,
-        1=Y, 2=Z).  Clifford mode (basis values 0–23) and custom modes with
-        non-Pauli basis labels are not supported and will raise ValueError.
+        Supported measurement modes and token_type combinations:
+          - pauli / random  ×  basis_outcome | pauli_string | binary
+          - clifford        ×  basis_outcome | binary
+          - custom          ×  basis_outcome | binary
+
+        pauli_string mode is restricted to pauli/random measurements because
+        clifford and custom basis indices cannot be mapped to X/Y/Z characters.
+        This restriction is also enforced at construction time via __init__.
 
         Args:
             measurement: A ShadowMeasurement with .basis and .outcome arrays
@@ -168,16 +223,17 @@ class ShadowTokenizer:
         if len(basis) == 0:
             return []
 
+        n_bases = self._basis_count()
         unk = self.special_tokens["UNK"]
         tokens: List[int] = []
 
         if self.config.token_type == "basis_outcome":
             for b, o in zip(basis.tolist(), outcome.tolist()):
                 b_int, o_int = int(b), int(o)
-                if b_int not in (0, 1, 2):
+                if not (0 <= b_int < n_bases):
                     raise ValueError(
-                        f"Invalid basis value {b_int} at qubit; "
-                        f"expected 0 (X), 1 (Y), or 2 (Z)."
+                        f"Invalid basis value {b_int}; expected 0 … {n_bases - 1} "
+                        f"for measurement_mode={self.config.measurement_mode!r}."
                     )
                 if o_int not in (0, 1):
                     raise ValueError(
@@ -186,6 +242,7 @@ class ShadowTokenizer:
                 tokens.append(self.vocab.get(f"B{b_int}O{o_int}", unk))
 
         elif self.config.token_type == "pauli_string":
+            # Already guarded in __init__; double-check at tokenization time.
             for b in basis.tolist():
                 b_int = int(b)
                 ch = _PAULI_MAP.get(b_int)
@@ -197,18 +254,20 @@ class ShadowTokenizer:
                 tokens.append(self.vocab.get(ch, unk))
 
         elif self.config.token_type == "binary":
+            b_bits = self._basis_bits()
+            fmt_basis = f"0{b_bits}b"
             for b, o in zip(basis.tolist(), outcome.tolist()):
                 b_int, o_int = int(b), int(o)
-                if b_int not in (0, 1, 2):
+                if not (0 <= b_int < n_bases):
                     raise ValueError(
-                        f"Invalid basis value {b_int} for binary mode; "
-                        f"expected 0 (X), 1 (Y), or 2 (Z)."
+                        f"Invalid basis value {b_int}; expected 0 … {n_bases - 1} "
+                        f"for measurement_mode={self.config.measurement_mode!r}."
                     )
                 if o_int not in (0, 1):
                     raise ValueError(
                         f"Invalid outcome value {o_int}; expected 0 or 1."
                     )
-                for ch in format(b_int, "02b") + format(o_int, "01b"):
+                for ch in format(b_int, fmt_basis) + format(o_int, "01b"):
                     tokens.append(self.vocab.get(ch, unk))
 
         return tokens
@@ -331,6 +390,7 @@ class ShadowTokenizer:
     def __repr__(self) -> str:
         return (
             f"ShadowTokenizer(token_type={self.config.token_type!r}, "
+            f"measurement_mode={self.config.measurement_mode!r}, "
             f"vocab_size={self.get_vocab_size()}, "
             f"max_length={self.config.max_sequence_length})"
         )
@@ -343,13 +403,20 @@ class ShadowTokenizer:
 def create_default_tokenizer(
     n_qubits: int,
     token_type: str = "basis_outcome",
-) -> ShadowTokenizer:
+    measurement_mode: Optional[str] = None,
+    max_basis_value: int = 23,
+) -> "ShadowTokenizer":
     """
     Create a default ShadowTokenizer for an n-qubit system.
 
     Args:
-        n_qubits: Number of qubits per measurement.
-        token_type: One of "basis_outcome", "pauli_string", "binary".
+        n_qubits:         Number of qubits per measurement.
+        token_type:       One of "basis_outcome", "pauli_string", "binary".
+        measurement_mode: None / "pauli" / "random" for standard Pauli shadows;
+                          "clifford" for single-qubit Clifford shadows;
+                          "custom" for user-defined integer basis labels.
+        max_basis_value:  Largest basis label (inclusive).  Only used when
+                          measurement_mode="custom".
 
     Returns:
         A ready-to-use ShadowTokenizer.
@@ -360,8 +427,20 @@ def create_default_tokenizer(
             f"Must be one of: {sorted(_VALID_TOKEN_TYPES)}."
         )
 
-    # Tokens per measurement (excluding BOS/EOS)
-    tokens_per_measurement = 3 * n_qubits if token_type == "binary" else n_qubits
+    # Compute sequence length (excluding BOS/EOS) based on mode and token_type.
+    if token_type == "binary":
+        # Determine number of basis bits from measurement mode.
+        if measurement_mode == "clifford":
+            n_bases = 24
+        elif measurement_mode == "custom":
+            n_bases = max_basis_value + 1
+        else:
+            n_bases = 3
+        b_bits = max(1, math.ceil(math.log2(n_bases))) if n_bases > 1 else 1
+        tokens_per_measurement = (b_bits + 1) * n_qubits
+    else:
+        tokens_per_measurement = n_qubits
+
     max_seq_len = tokens_per_measurement + 2  # +2 for BOS / EOS
 
     config = TokenizationConfig(
@@ -369,5 +448,7 @@ def create_default_tokenizer(
         vocab_size=256,
         max_sequence_length=max_seq_len,
         token_type=token_type,
+        measurement_mode=measurement_mode,
+        max_basis_value=max_basis_value,
     )
     return ShadowTokenizer(config)
