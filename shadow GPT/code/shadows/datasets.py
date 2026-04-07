@@ -1,15 +1,35 @@
 """
-PyTorch dataset for classical shadow data.
+PyTorch dataset for classical shadow data — physical quantity prediction.
 
-This module provides the ShadowDataset class for loading and processing
-classical shadow data for training language models.
+This module provides ShadowDataset and ShadowDataModule for training a
+transformer to predict physical quantities (regression) from classical
+shadow token sequences.
+
+Pipeline position
+-----------------
+    collector  →  tokenizer  →  ShadowDataModule  →  ShadowTransformer
+                                     ↑
+                              targets (physical quantities,
+                              provided externally per measurement)
+
+Target convention
+-----------------
+One target value (scalar or vector) per shadow measurement.  Targets must
+be provided as a 1-D or 2-D array of length n_measurements alongside the
+collector when calling setup().  Typical sources:
+
+- ShadowProcessor.estimate_magnetization / estimate_energy (classical shadow
+  estimates, one per state — repeat the same value for all measurements from
+  that state).
+- Exact diagonalization or DMRG (ground-truth labels).
+- Any per-state physical quantity known externally.
 """
 
 import json
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -18,6 +38,10 @@ from torch.utils.data import DataLoader, Dataset
 from .collector import ShadowCollector
 from .tokenization import ShadowTokenizer, TokenizationConfig
 
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 @dataclass
 class DatasetConfig:
@@ -50,191 +74,197 @@ class DatasetConfig:
             )
 
 
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
 class ShadowDataset(Dataset):
     """
-    PyTorch dataset for classical shadow data.
+    PyTorch dataset for physical quantity prediction from shadow sequences.
 
-    Loads shadow measurements and converts them to token sequences
-    suitable for training language models.
+    Each item contains:
+        input_ids      — token sequence (already padded by the tokenizer)
+        attention_mask — 1 for real tokens, 0 for PAD positions
+        target         — physical quantity value(s), shape (n_targets,)
+                         (only present when targets were provided at init)
     """
 
     def __init__(
         self,
         token_sequences: List[List[int]],
         tokenizer: ShadowTokenizer,
+        targets: Optional[Union[np.ndarray, List]] = None,
         config: Optional[DatasetConfig] = None,
     ) -> None:
         """
-        Initialize shadow dataset.
-
         Args:
-            token_sequences: List of token sequences
-            tokenizer: ShadowTokenizer for processing
-            config: Dataset configuration (uses defaults if None)
+            token_sequences: List of integer token lists (one per measurement).
+            tokenizer:       ShadowTokenizer used to produce token_sequences.
+            targets:         Physical quantity labels, shape (n_samples,) or
+                             (n_samples, n_targets).  None for inference-only use.
+            config:          Dataset configuration.
         """
+        if targets is not None and len(targets) != len(token_sequences):
+            raise ValueError(
+                f"len(targets)={len(targets)} must equal "
+                f"len(token_sequences)={len(token_sequences)}."
+            )
+
         self.token_sequences = token_sequences
         self.tokenizer = tokenizer
         self.config = config or DatasetConfig()
-
-        # Convert to tensors
         self.sequences = self._prepare_sequences()
 
+        # Store targets as float32 tensor, always 2-D: (N, n_targets)
+        if targets is not None:
+            t = np.asarray(targets, dtype=np.float32)
+            if t.ndim == 1:
+                t = t[:, None]
+            self.targets: Optional[torch.Tensor] = torch.tensor(t, dtype=torch.float32)
+        else:
+            self.targets = None
+
     def _prepare_sequences(self) -> List[torch.Tensor]:
-        """Prepare token sequences as PyTorch tensors."""
-        sequences = []
-        for tokens in self.token_sequences:
-            sequence = torch.tensor(tokens, dtype=torch.long)
-            sequences.append(sequence)
-        return sequences
+        """Convert token lists to LongTensors."""
+        return [
+            torch.tensor(tokens, dtype=torch.long)
+            for tokens in self.token_sequences
+        ]
 
     def __len__(self) -> int:
-        """Get dataset length."""
         return len(self.sequences)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
-        Get item from dataset.
-
-        Args:
-            idx: Index of the item
+        Return one sample for regression.
 
         Returns:
-            Dictionary with input_ids and labels for language modeling.
-            For a sequence [t0, t1, ..., tN]:
-                input_ids = [t0, ..., t_{N-1}]
-                labels    = [t1, ..., tN]
+            input_ids      shape (seq_len,)
+            attention_mask shape (seq_len,)  — 1 = real, 0 = PAD
+            target         shape (n_targets,)  — only if targets were given
         """
         sequence = self.sequences[idx]
+        pad_id = self.tokenizer.special_tokens["PAD"]
+        attention_mask = (sequence != pad_id).long()
 
-        # For causal language modeling: input is sequence[:-1], target is sequence[1:]
-        input_ids = sequence[:-1] if len(sequence) > 1 else sequence
-        labels = sequence[1:] if len(sequence) > 1 else sequence
-
-        return {"input_ids": input_ids, "labels": labels}
+        item: Dict[str, torch.Tensor] = {
+            "input_ids": sequence,
+            "attention_mask": attention_mask,
+        }
+        if self.targets is not None:
+            item["target"] = self.targets[idx]
+        return item
 
     def collate_fn(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         """
-        Collate function for batching variable-length sequences.
+        Collate a list of samples into a batch.
 
-        Pads input_ids with PAD token and labels with -100 (ignored by
-        cross-entropy loss).  Attention mask is aligned with input_ids padding.
-
-        Args:
-            batch: List of samples from __getitem__
-
-        Returns:
-            Batched tensors: input_ids, labels, attention_mask
+        Pads input_ids / attention_mask to the longest sequence in the batch
+        (no-op when the tokenizer already pads everything to max_seq_len).
+        Targets are simply stacked.
         """
-        max_length = max(len(sample["input_ids"]) for sample in batch)
-        pad_token = self.tokenizer.special_tokens["PAD"]
+        max_len = max(len(s["input_ids"]) for s in batch)
+        pad_id = self.tokenizer.special_tokens["PAD"]
 
-        input_ids_list = []
-        labels_list = []
-        attention_masks_list = []
+        input_ids_list: List[torch.Tensor] = []
+        attn_mask_list: List[torch.Tensor] = []
 
-        for sample in batch:
-            input_seq = sample["input_ids"]
-            label_seq = sample["labels"]
+        for s in batch:
+            seq = s["input_ids"]
+            mask = s["attention_mask"]
+            pad_needed = max_len - len(seq)
+            if pad_needed > 0:
+                seq = torch.cat([seq, torch.full((pad_needed,), pad_id, dtype=torch.long)])
+                mask = torch.cat([mask, torch.zeros(pad_needed, dtype=torch.long)])
+            input_ids_list.append(seq)
+            attn_mask_list.append(mask)
 
-            # Compute padding amounts separately to keep attention mask correct.
-            input_pad = max_length - len(input_seq)
-            label_pad = max_length - len(label_seq)
-
-            if input_pad > 0:
-                input_seq = torch.cat([
-                    input_seq,
-                    torch.full((input_pad,), pad_token, dtype=torch.long),
-                ])
-            if label_pad > 0:
-                # -100 is ignored by PyTorch cross-entropy loss
-                label_seq = torch.cat([
-                    label_seq,
-                    torch.full((label_pad,), -100, dtype=torch.long),
-                ])
-
-            # Attention mask is 1 for real tokens, 0 for input padding.
-            attention_mask = torch.ones(max_length, dtype=torch.long)
-            if input_pad > 0:
-                attention_mask[-input_pad:] = 0
-
-            input_ids_list.append(input_seq)
-            labels_list.append(label_seq)
-            attention_masks_list.append(attention_mask)
-
-        return {
-            "input_ids": torch.stack(input_ids_list),
-            "labels": torch.stack(labels_list),
-            "attention_mask": torch.stack(attention_masks_list),
+        result: Dict[str, torch.Tensor] = {
+            "input_ids": torch.stack(input_ids_list),       # (B, L)
+            "attention_mask": torch.stack(attn_mask_list),  # (B, L)
         }
+        if "target" in batch[0]:
+            result["target"] = torch.stack([s["target"] for s in batch])  # (B, n_targets)
+        return result
 
+
+# ---------------------------------------------------------------------------
+# Data module
+# ---------------------------------------------------------------------------
 
 class ShadowDataModule:
     """
     Data module for managing shadow datasets and data loaders.
 
-    Handles dataset creation, splitting, and data loader setup for training.
+    Handles tokenization, target alignment, dataset splitting, and
+    DataLoader setup for training a regression model.
     """
 
     def __init__(self, config: DatasetConfig) -> None:
-        """
-        Initialize shadow data module.
-
-        Args:
-            config: Dataset configuration
-        """
         self.config = config
         self.train_dataset: Optional[ShadowDataset] = None
-        self.val_dataset: Optional[ShadowDataset] = None
-        self.test_dataset: Optional[ShadowDataset] = None
-        self.tokenizer: Optional[ShadowTokenizer] = None
+        self.val_dataset:   Optional[ShadowDataset] = None
+        self.test_dataset:  Optional[ShadowDataset] = None
+        self.tokenizer:     Optional[ShadowTokenizer] = None
 
-    def setup(self, collector: ShadowCollector, tokenizer: ShadowTokenizer) -> None:
+    def setup(
+        self,
+        collector: ShadowCollector,
+        tokenizer: ShadowTokenizer,
+        targets: Optional[Union[np.ndarray, List]] = None,
+    ) -> None:
         """
-        Setup datasets from shadow collector.
+        Tokenize measurements and split into train / val / test datasets.
 
         Args:
-            collector: ShadowCollector with measurements
-            tokenizer: ShadowTokenizer for processing
+            collector: ShadowCollector with measurements already collected.
+            tokenizer: ShadowTokenizer matching the measurement mode.
+            targets:   Physical quantity labels, shape (n_measurements,) or
+                       (n_measurements, n_targets).  Must be provided for
+                       training; may be None for inference-only use.
         """
         self.tokenizer = tokenizer
 
-        # Tokenize measurements and wrap with BOS/EOS
         token_sequences = tokenizer.tokenize_collector(collector)
         sequences = tokenizer.create_sequences(token_sequences, add_special_tokens=True)
 
-        self._split_dataset(sequences)
+        targets_arr = np.asarray(targets) if targets is not None else None
+        self._split_dataset(sequences, targets_arr)
 
-    def _split_dataset(self, sequences: List[List[int]]) -> None:
+    def _split_dataset(
+        self,
+        sequences: List[List[int]],
+        targets: Optional[np.ndarray] = None,
+    ) -> None:
         """
-        Split sequences into train/val/test sets.
+        Split sequences (and optional targets) into train / val / test sets.
 
         Train and val sizes are determined by their configured fractions
-        (rounded down via int()).  Test receives all remaining sequences,
-        which may differ slightly from test_split due to integer rounding.
+        (rounded down via int()).  Test receives all remaining sequences.
         """
         n_total = len(sequences)
         if n_total == 0:
             raise ValueError("Cannot split an empty sequence list.")
 
-        # Shuffle with optional seed for reproducibility
         if self.config.shuffle:
             rng = np.random.default_rng(self.config.shuffle_seed)
             indices = np.arange(n_total)
             rng.shuffle(indices)
             sequences = [sequences[i] for i in indices]
+            if targets is not None:
+                targets = targets[indices]
 
         n_train = int(n_total * self.config.train_split)
-        n_val = int(n_total * self.config.val_split)
-        # Test receives the remainder; may differ slightly from test_split
-        # due to int() rounding on train and val.
+        n_val   = int(n_total * self.config.val_split)
 
-        train_sequences = sequences[:n_train]
-        val_sequences = sequences[n_train:n_train + n_val]
-        test_sequences = sequences[n_train + n_val:]
+        splits = {
+            "train": (sequences[:n_train],              targets[:n_train]              if targets is not None else None),
+            "val":   (sequences[n_train:n_train+n_val], targets[n_train:n_train+n_val] if targets is not None else None),
+            "test":  (sequences[n_train+n_val:],        targets[n_train+n_val:]        if targets is not None else None),
+        }
 
-        # Warn if any split is unexpectedly empty
-        for name, split in [("train", train_sequences), ("val", val_sequences), ("test", test_sequences)]:
-            if len(split) == 0:
+        for name, (seqs, _) in splits.items():
+            if len(seqs) == 0:
                 warnings.warn(
                     f"{name} split is empty (n_total={n_total}, "
                     f"train_split={self.config.train_split}, "
@@ -243,17 +273,20 @@ class ShadowDataModule:
                     stacklevel=2,
                 )
 
-        self.train_dataset = ShadowDataset(train_sequences, self.tokenizer, self.config)
-        self.val_dataset = ShadowDataset(val_sequences, self.tokenizer, self.config)
-        self.test_dataset = ShadowDataset(test_sequences, self.tokenizer, self.config)
+        self.train_dataset = ShadowDataset(splits["train"][0], self.tokenizer, splits["train"][1], self.config)
+        self.val_dataset   = ShadowDataset(splits["val"][0],   self.tokenizer, splits["val"][1],   self.config)
+        self.test_dataset  = ShadowDataset(splits["test"][0],  self.tokenizer, splits["test"][1],  self.config)
 
         print(
-            f"Dataset split: {len(train_sequences)} train, "
-            f"{len(val_sequences)} val, {len(test_sequences)} test"
+            f"Dataset split: {len(splits['train'][0])} train, "
+            f"{len(splits['val'][0])} val, {len(splits['test'][0])} test"
         )
 
+    # ------------------------------------------------------------------
+    # DataLoaders
+    # ------------------------------------------------------------------
+
     def get_train_dataloader(self) -> DataLoader:
-        """Get training data loader."""
         if self.train_dataset is None:
             raise ValueError("Dataset not setup. Call setup() first.")
         return DataLoader(
@@ -267,7 +300,6 @@ class ShadowDataModule:
         )
 
     def get_val_dataloader(self) -> DataLoader:
-        """Get validation data loader."""
         if self.val_dataset is None:
             raise ValueError("Dataset not setup. Call setup() first.")
         return DataLoader(
@@ -281,7 +313,6 @@ class ShadowDataModule:
         )
 
     def get_test_dataloader(self) -> DataLoader:
-        """Get test data loader."""
         if self.test_dataset is None:
             raise ValueError("Dataset not setup. Call setup() first.")
         return DataLoader(
@@ -294,8 +325,19 @@ class ShadowDataModule:
             collate_fn=self.test_dataset.collate_fn,
         )
 
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
+
     def get_dataset_info(self) -> Dict[str, Any]:
-        """Get information about the datasets."""
+        """Return a summary dict describing the current datasets."""
+        has_targets = (
+            self.train_dataset is not None and self.train_dataset.targets is not None
+        )
+        n_targets = (
+            self.train_dataset.targets.shape[1]
+            if has_targets else 0
+        )
         return {
             "tokenizer": {
                 "vocab_size": self.tokenizer.get_vocab_size() if self.tokenizer else None,
@@ -304,8 +346,12 @@ class ShadowDataModule:
             },
             "datasets": {
                 "train_size": len(self.train_dataset) if self.train_dataset else 0,
-                "val_size": len(self.val_dataset) if self.val_dataset else 0,
-                "test_size": len(self.test_dataset) if self.test_dataset else 0,
+                "val_size":   len(self.val_dataset)   if self.val_dataset   else 0,
+                "test_size":  len(self.test_dataset)  if self.test_dataset  else 0,
+            },
+            "targets": {
+                "has_targets": has_targets,
+                "n_targets": n_targets,
             },
             "config": self.config.__dict__,
         }
@@ -314,24 +360,21 @@ class ShadowDataModule:
         """
         Save tokenizer and dataset metadata to disk.
 
-        Note: this method saves the tokenizer vocabulary (tokenizer.json) and
-        a dataset_info.json summary file.  It does NOT serialize the raw token
-        sequences or PyTorch tensors.  To persist the actual data, save the
-        token sequences separately before calling setup().
+        Saves:
+          tokenizer.json    — vocabulary and tokenizer config
+          dataset_info.json — split sizes and config summary
 
-        Args:
-            output_dir: Directory in which to write the output files
+        Note: raw token sequences and regression targets are NOT serialized
+        here.  To persist them, save targets separately before calling setup().
         """
         if self.train_dataset is None:
             raise ValueError("Dataset not setup. Call setup() first.")
 
         os.makedirs(output_dir, exist_ok=True)
 
-        tokenizer_path = os.path.join(output_dir, "tokenizer.json")
-        self.tokenizer.save_tokenizer(tokenizer_path)
+        self.tokenizer.save_tokenizer(os.path.join(output_dir, "tokenizer.json"))
 
-        info_path = os.path.join(output_dir, "dataset_info.json")
-        with open(info_path, "w") as f:
+        with open(os.path.join(output_dir, "dataset_info.json"), "w") as f:
             json.dump(self.get_dataset_info(), f, indent=2)
 
         print(f"Saved tokenizer and dataset info to {output_dir}")
@@ -343,25 +386,29 @@ class ShadowDataModule:
         )
 
 
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
 def create_data_module(
     collector: ShadowCollector,
     tokenizer: ShadowTokenizer,
+    targets: Optional[Union[np.ndarray, List]] = None,
     config: Optional[DatasetConfig] = None,
 ) -> ShadowDataModule:
     """
-    Convenience function to create a shadow data module.
+    Convenience function to create and setup a ShadowDataModule.
 
     Args:
-        collector: ShadowCollector with measurements
-        tokenizer: ShadowTokenizer for processing
-        config: Dataset configuration (uses defaults if None)
+        collector: ShadowCollector with measurements.
+        tokenizer: ShadowTokenizer for encoding.
+        targets:   Physical quantity labels, shape (n_measurements,) or
+                   (n_measurements, n_targets).
+        config:    Dataset configuration (uses defaults if None).
 
     Returns:
-        Configured ShadowDataModule
+        Configured and ready ShadowDataModule.
     """
-    if config is None:
-        config = DatasetConfig()
-
-    data_module = ShadowDataModule(config)
-    data_module.setup(collector, tokenizer)
-    return data_module
+    dm = ShadowDataModule(config or DatasetConfig())
+    dm.setup(collector, tokenizer, targets)
+    return dm

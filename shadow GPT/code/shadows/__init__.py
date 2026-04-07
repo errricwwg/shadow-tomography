@@ -26,11 +26,24 @@ from .processor import ShadowProcessor, process_shadow_data
 from .tokenization import ShadowTokenizer, create_default_tokenizer
 
 try:
-    from .datasets import ShadowDataModule, ShadowDataset, create_data_module
+    from .datasets import ShadowDataModule, ShadowDataset, DatasetConfig, create_data_module
+    from .model import (
+        ShadowModelConfig,
+        ShadowTransformer,
+        ShadowTrainer,
+        create_model_from_tokenizer,
+    )
+    _TORCH_AVAILABLE = True
 except ModuleNotFoundError:
-    ShadowDataModule = None  # type: ignore[assignment]
-    ShadowDataset = None  # type: ignore[assignment]
-    create_data_module = None  # type: ignore[assignment]
+    ShadowDataModule = None          # type: ignore[assignment]
+    ShadowDataset = None             # type: ignore[assignment]
+    DatasetConfig = None             # type: ignore[assignment]
+    create_data_module = None        # type: ignore[assignment]
+    ShadowModelConfig = None         # type: ignore[assignment]
+    ShadowTransformer = None         # type: ignore[assignment]
+    ShadowTrainer = None             # type: ignore[assignment]
+    create_model_from_tokenizer = None  # type: ignore[assignment]
+    _TORCH_AVAILABLE = False
 
 __all__ = [
     "ShadowConfig",
@@ -49,9 +62,14 @@ __all__ = [
     "create_default_tokenizer",
 ]
 
-if ShadowDataset is not None:
+if _TORCH_AVAILABLE:
     __all__.extend([
+        "DatasetConfig",
         "ShadowDataset",
         "ShadowDataModule",
         "create_data_module",
+        "ShadowModelConfig",
+        "ShadowTransformer",
+        "ShadowTrainer",
+        "create_model_from_tokenizer",
     ])
