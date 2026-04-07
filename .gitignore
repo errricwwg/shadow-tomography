@@ -1,0 +1,7 @@
+measurement_data.txt
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+.local_test_deps/
+.local_test_src/
