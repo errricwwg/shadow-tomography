@@ -31,6 +31,8 @@ try:
         ShadowModelConfig,
         ShadowTransformer,
         ShadowTrainer,
+        TargetScaler,
+        TARGET_NAMES,
         create_model_from_tokenizer,
     )
     _TORCH_AVAILABLE = True
@@ -39,10 +41,12 @@ except ModuleNotFoundError:
     ShadowDataset = None             # type: ignore[assignment]
     DatasetConfig = None             # type: ignore[assignment]
     create_data_module = None        # type: ignore[assignment]
-    ShadowModelConfig = None         # type: ignore[assignment]
-    ShadowTransformer = None         # type: ignore[assignment]
-    ShadowTrainer = None             # type: ignore[assignment]
-    create_model_from_tokenizer = None  # type: ignore[assignment]
+    ShadowModelConfig = None              # type: ignore[assignment]
+    ShadowTransformer = None              # type: ignore[assignment]
+    ShadowTrainer = None                  # type: ignore[assignment]
+    TargetScaler = None                   # type: ignore[assignment]
+    TARGET_NAMES = None                   # type: ignore[assignment]
+    create_model_from_tokenizer = None    # type: ignore[assignment]
     _TORCH_AVAILABLE = False
 
 __all__ = [
@@ -71,5 +75,7 @@ if _TORCH_AVAILABLE:
         "ShadowModelConfig",
         "ShadowTransformer",
         "ShadowTrainer",
+        "TargetScaler",
+        "TARGET_NAMES",
         "create_model_from_tokenizer",
     ])
