@@ -10,9 +10,10 @@ Architecture
                     →  4D physical quantity prediction
 
 The four output targets are ordered as:
-    [magnetization, correlations, x_magnetization, renyi_entropy]
+    [magnetization, correlations, energy, renyi_entropy]
 
-where x_magnetization = (1/n) sum_i <X_i> (exact from state vector).
+where energy = <H_TFIM> for H = -J sum_i Z_i Z_{i+1} - h sum_i X_i
+(transverse-field Ising model, exact from state vector, J=1, h=0.5, OBC).
 
 All components use PyTorch built-ins; no Hugging Face dependency.
 
@@ -31,10 +32,10 @@ Target ordering convention
 When building targets from ShadowProcessor estimates, use:
 
     targets = np.column_stack([
-        magnetization_values,    # column 0  — shadow estimate
-        correlation_values,      # column 1  — shadow estimate
-        x_magnetization_values,  # column 2  — exact from state vector
-        renyi_entropy_values,    # column 3  — shadow estimate
+        magnetization_values,   # column 0  — shadow estimate
+        correlation_values,     # column 1  — shadow estimate
+        energy_values,          # column 2  — exact <H_TFIM> from state vector
+        renyi_entropy_values,   # column 3  — shadow estimate
     ])
 
 TARGET_NAMES is exported for convenience.
@@ -53,7 +54,7 @@ from torch.utils.data import DataLoader
 from .tokenization import ShadowTokenizer
 
 # Physical quantity names in the order expected by this model.
-TARGET_NAMES: List[str] = ["magnetization", "correlations", "x_magnetization", "renyi_entropy"]
+TARGET_NAMES: List[str] = ["magnetization", "correlations", "energy", "renyi_entropy"]
 
 # Default number of physical targets.
 _N_TARGETS: int = 4
