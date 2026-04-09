@@ -10,9 +10,9 @@ Architecture
                     →  4D physical quantity prediction
 
 The four output targets are ordered as:
-    [magnetization, correlations, energy, renyi_entropy]
+    [magnetization, correlations, x_magnetization, renyi_entropy]
 
-This matches the outputs of ShadowProcessor in processor.py.
+where x_magnetization = (1/n) sum_i <X_i> (exact from state vector).
 
 All components use PyTorch built-ins; no Hugging Face dependency.
 
@@ -31,10 +31,10 @@ Target ordering convention
 When building targets from ShadowProcessor estimates, use:
 
     targets = np.column_stack([
-        magnetization_values,   # column 0
-        correlation_values,     # column 1
-        energy_values,          # column 2
-        renyi_entropy_values,   # column 3
+        magnetization_values,    # column 0  — shadow estimate
+        correlation_values,      # column 1  — shadow estimate
+        x_magnetization_values,  # column 2  — exact from state vector
+        renyi_entropy_values,    # column 3  — shadow estimate
     ])
 
 TARGET_NAMES is exported for convenience.
@@ -53,7 +53,7 @@ from torch.utils.data import DataLoader
 from .tokenization import ShadowTokenizer
 
 # Physical quantity names in the order expected by this model.
-TARGET_NAMES: List[str] = ["magnetization", "correlations", "energy", "renyi_entropy"]
+TARGET_NAMES: List[str] = ["magnetization", "correlations", "x_magnetization", "renyi_entropy"]
 
 # Default number of physical targets.
 _N_TARGETS: int = 4
