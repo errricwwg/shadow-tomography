@@ -72,7 +72,7 @@ from shadows.config import create_default_config
 from shadows.collector import ShadowCollector
 from shadows.processor import ShadowProcessor
 from shadows.tokenization import create_default_tokenizer
-from shadows.datasets import ShadowDataModule, DatasetConfig
+from shadows.datasets import ShadowDataModule, ShadowDataset, DatasetConfig
 from shadows.model import (
     create_model_from_tokenizer,
     ShadowTrainer,
@@ -310,7 +310,36 @@ def train(args: argparse.Namespace) -> None:
     )
     print(f"\nTokenizer   : {tokenizer}")
 
-    # ── 3. DataModule ─────────────────────────────────────────────────────────
+    # ── 3. State-level split → DataModule ─────────────────────────────────────
+    # generate_dataset() appends measurements in state order:
+    # measurements 0..S-1 = state 0, S..2S-1 = state 1, etc.
+    # Splitting at the measurement level (the old approach) would allow
+    # measurements from the same state to appear in multiple splits, leaking
+    # label information from train into val/test.
+    # Fix: assign each state to exactly one split first, then flatten.
+    S = args.n_shadows_per_state
+
+    split_rng = np.random.default_rng(args.seed)
+    state_order = np.arange(args.n_states)
+    split_rng.shuffle(state_order)
+    n_train_s = int(args.n_states * 0.8)
+    n_val_s   = int(args.n_states * 0.1)
+    train_states = set(state_order[:n_train_s])
+    val_states   = set(state_order[n_train_s:n_train_s + n_val_s])
+
+    # measurement k was produced by state k // S
+    state_of_meas = np.repeat(np.arange(args.n_states), S)
+    train_mask = np.array([s in train_states for s in state_of_meas])
+    val_mask   = np.array([s in val_states   for s in state_of_meas])
+    test_mask  = ~(train_mask | val_mask)
+
+    # Tokenize the full collector once, then index by split mask
+    token_seqs = tokenizer.tokenize_collector(collector)
+    all_seqs   = tokenizer.create_sequences(token_seqs, add_special_tokens=True)
+
+    def _select_seqs(mask):
+        return [all_seqs[i] for i, m in enumerate(mask) if m]
+
     dm_cfg = DatasetConfig(
         batch_size=args.batch_size,
         shuffle=True,
@@ -322,12 +351,17 @@ def train(args: argparse.Namespace) -> None:
         num_workers=0,
     )
     dm = ShadowDataModule(dm_cfg)
-    dm.setup(collector, tokenizer, targets=targets)
+    dm.tokenizer = tokenizer
+    dm.train_dataset = ShadowDataset(_select_seqs(train_mask), tokenizer, targets[train_mask], dm_cfg)
+    dm.val_dataset   = ShadowDataset(_select_seqs(val_mask),   tokenizer, targets[val_mask],   dm_cfg)
+    dm.test_dataset  = ShadowDataset(_select_seqs(test_mask),  tokenizer, targets[test_mask],  dm_cfg)
 
+    n_train_states_test = args.n_states - n_train_s - n_val_s
     n_train = len(dm.train_dataset)
     n_val   = len(dm.val_dataset)
     n_test  = len(dm.test_dataset)
-    print(f"\nDataset split : {n_train} train / {n_val} val / {n_test} test")
+    print(f"\nDataset split : {n_train} train / {n_val} val / {n_test} test"
+          f"  (state-level: {n_train_s} / {n_val_s} / {n_train_states_test} states)")
     print(f"Sequence length: {tokenizer.config.max_sequence_length} tokens")
 
     # ── 4. Target scaler (fit on train split only) ────────────────────────────
