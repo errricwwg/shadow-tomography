@@ -7,10 +7,10 @@ Architecture
                     →  TransformerEncoder (N pre-norm layers)
                     →  Masked-mean pooling (respects attention_mask)
                     →  LayerNorm → Linear regression head
-                    →  4D physical quantity prediction
+                    →  3D physical quantity prediction
 
-The four output targets are ordered as:
-    [magnetization, correlations, energy, renyi_entropy]
+The three output targets are ordered as:
+    [magnetization, correlations, energy]
 
 where energy = <H_TFIM> for H = -J sum_i Z_i Z_{i+1} - h sum_i X_i
 (transverse-field Ising model, exact from state vector, J=1, h=0.5, OBC).
@@ -23,7 +23,7 @@ Typical use
     from shadows.model import create_model_from_tokenizer, ShadowTrainer
 
     tokenizer = create_default_tokenizer(n_qubits=8)
-    model = create_model_from_tokenizer(tokenizer, n_outputs=4)
+    model = create_model_from_tokenizer(tokenizer, n_outputs=3)
     trainer = ShadowTrainer(model)
     trainer.fit(train_loader, val_loader, n_epochs=30)
 
@@ -35,7 +35,6 @@ When building targets from ShadowProcessor estimates, use:
         magnetization_values,   # column 0  — shadow estimate
         correlation_values,     # column 1  — shadow estimate
         energy_values,          # column 2  — exact <H_TFIM> from state vector
-        renyi_entropy_values,   # column 3  — shadow estimate
     ])
 
 TARGET_NAMES is exported for convenience.
@@ -54,10 +53,10 @@ from torch.utils.data import DataLoader
 from .tokenization import ShadowTokenizer
 
 # Physical quantity names in the order expected by this model.
-TARGET_NAMES: List[str] = ["magnetization", "correlations", "energy", "renyi_entropy"]
+TARGET_NAMES: List[str] = ["magnetization", "correlations", "energy"]
 
 # Default number of physical targets.
-_N_TARGETS: int = 4
+_N_TARGETS: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +72,7 @@ class ShadowModelConfig:
     --------------
     vocab_size    : must match tokenizer.get_vocab_size()
     max_seq_len   : must match tokenizer.config.max_sequence_length
-    n_outputs     : 4 for the four physical quantities; 1 for a single target
+    n_outputs     : 3 for the three physical quantities; 1 for a single target
     pad_token_id  : must match tokenizer.special_tokens["PAD"]
     pooling       : sequence aggregation strategy
                     "mean" — masked mean over non-PAD positions (default)
@@ -569,8 +568,8 @@ def create_model_from_tokenizer(
 
     Args:
         tokenizer:     ShadowTokenizer whose vocab_size and max_seq_len are used.
-        n_outputs:     Number of regression targets.  4 for the full set of
-                       [magnetization, correlations, energy, renyi_entropy].
+        n_outputs:     Number of regression targets.  3 for the full set of
+                       [magnetization, correlations, energy].
         d_model:       Embedding / hidden dimension.  128 trains quickly on CPU;
                        use 256 or 512 for larger datasets.
         n_heads:       Attention heads (must divide d_model).

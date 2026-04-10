@@ -5,17 +5,16 @@ Pipeline
 --------
     random quantum states
         → ShadowCollector (random Pauli measurements)
-        → ShadowProcessor (magnetization, correlations, renyi_entropy)
+        → ShadowProcessor (magnetization, correlations)
         → exact TFIM energy from state vector (column 2)
         → ShadowDataModule (tokenize, split, DataLoaders)
-        → ShadowTransformer (4-target regression)
+        → ShadowTransformer (3-target regression)
         → ShadowTrainer (fit, validate, checkpoint)
 
 Target ordering (fixed throughout):
     column 0 — magnetization    (1/n) sum_i <Z_i>       shadow estimate
     column 1 — correlations     avg <Z_i Z_{i+1}>        shadow estimate
     column 2 — energy           <H_TFIM>                 exact from state vector
-    column 3 — renyi_entropy    S_2 half-chain           shadow estimate
 
 Energy target: transverse-field Ising model (TFIM)
 ---------------------------------------------------
@@ -169,7 +168,7 @@ def generate_dataset(
         1. Creating n_states random quantum states.
         2. Building the TFIM Hamiltonian matrix once (shared across all states).
         3. Collecting n_shadows_per_state measurements per state.
-        4. Computing 4D physical quantity targets per state via ShadowProcessor
+        4. Computing 3D physical quantity targets per state via ShadowProcessor
            plus exact TFIM energy from the state vector.
         5. Broadcasting each state's target across its n_shadows measurements.
 
@@ -185,9 +184,9 @@ def generate_dataset(
     -------
     merged_collector : ShadowCollector
         Single collector holding all n_states × n_shadows_per_state measurements.
-    targets : np.ndarray, shape (n_states * n_shadows_per_state, 4), float32
+    targets : np.ndarray, shape (n_states * n_shadows_per_state, 3), float32
         Target matrix; rows align with measurements in merged_collector.
-        Columns: [magnetization, correlations, energy, renyi_entropy]
+        Columns: [magnetization, correlations, energy]
     """
     rng = np.random.default_rng(seed)
     total = n_states * n_shadows_per_state
@@ -220,7 +219,7 @@ def generate_dataset(
         collector = ShadowCollector(cfg)
         collector.sample_dense(sv)
 
-        # ── 3. Processor estimates (magnetization, correlations, renyi) ───────
+        # ── 3. Processor estimates (magnetization, correlations) ─────────────
         proc_cfg = create_default_config(
             n_qubits=n_qubits,
             n_shadows=n_shadows_per_state,
@@ -229,24 +228,22 @@ def generate_dataset(
         processor = ShadowProcessor(proc_cfg)
         estimates = processor.process_shadows(collector)
 
-        # ── 4. Build 4D target vector for this state ──────────────────────────
+        # ── 4. Build 3D target vector for this state ──────────────────────────
         #   col 0: magnetization  — (1/n) sum <Z_i>,            shadow estimate
         #   col 1: correlations   — avg <Z_i Z_{i+1}>,          shadow estimate
         #   col 2: energy         — <H_TFIM> exact from state   (NOT redundant:
         #                           contains ZZ two-body + X transverse terms)
-        #   col 3: renyi_entropy  — S_2 half-chain purity,      shadow estimate
-        target_4d = np.array([
+        target_3d = np.array([
             estimates["magnetization"].estimate,   # col 0
             estimates["correlations"].estimate,    # col 1
             _tfim_energy(sv, H_matrix),            # col 2 — exact TFIM energy
-            estimates["renyi_entropy"].estimate,   # col 3
         ], dtype=np.float32)
 
         # ── 5. Broadcast target across all measurements from this state ───────
         all_measurements.extend(collector.measurements)
         all_targets.append(
-            np.tile(target_4d, (n_shadows_per_state, 1))
-        )   # shape (n_shadows_per_state, 4)
+            np.tile(target_3d, (n_shadows_per_state, 1))
+        )   # shape (n_shadows_per_state, 3)
 
         if (state_idx + 1) % max(1, n_states // 10) == 0:
             elapsed = time.time() - t0
@@ -260,10 +257,10 @@ def generate_dataset(
     merged_collector = ShadowCollector(merged_cfg)
     merged_collector.measurements = all_measurements
 
-    targets = np.vstack(all_targets).astype(np.float32)   # (total, 4)
+    targets = np.vstack(all_targets).astype(np.float32)   # (total, 3)
 
     assert len(merged_collector.measurements) == total
-    assert targets.shape == (total, 4)
+    assert targets.shape == (total, 3)
 
     return merged_collector, targets
 
@@ -276,7 +273,7 @@ def train(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\n{'='*60}")
-    print(f"Shadow Transformer — 4-target regression baseline")
+    print(f"Shadow Transformer — 3-target regression baseline")
     print(f"{'='*60}")
     print(f"Device      : {device}")
     print(f"n_qubits    : {args.n_qubits}")
@@ -341,7 +338,7 @@ def train(args: argparse.Namespace) -> None:
         dm.train_dataset[i]["target"].numpy()
         for i in range(n_train)
     ])   # (n_train, 4)
-    scaler = TargetScaler(n_outputs=4)
+    scaler = TargetScaler(n_outputs=3)
     scaler.fit(train_targets)
     print(f"\nTarget scaler fitted on {n_train} training samples.")
     for i, name in enumerate(TARGET_NAMES):
@@ -350,7 +347,7 @@ def train(args: argparse.Namespace) -> None:
     # ── 5. Model ──────────────────────────────────────────────────────────────
     model = create_model_from_tokenizer(
         tokenizer,
-        n_outputs=4,
+        n_outputs=3,
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
@@ -438,7 +435,7 @@ def train(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Train a shadow transformer for 4-target physical quantity regression.",
+        description="Train a shadow transformer for 3-target physical quantity regression.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
