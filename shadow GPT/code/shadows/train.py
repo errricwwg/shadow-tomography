@@ -45,6 +45,9 @@ Usage
 
     # Change coupling constants:
     python train.py --tfim-J 1.0 --tfim-h 1.0
+
+    # Multi-seed evaluation (runs seeds 0..4, prints mean ± std):
+    python train.py --n-states 100 --n-shadows 100 --n-epochs 20 --multi-seed 5
 """
 
 import argparse
@@ -269,7 +272,7 @@ def generate_dataset(
 # Training entry point
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
 
-def train(args: argparse.Namespace) -> None:
+def train(args: argparse.Namespace) -> dict:
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\n{'='*60}")
@@ -462,6 +465,80 @@ def train(args: argparse.Namespace) -> None:
     print(f"Saved best checkpoint → {checkpoint_path}")
     print(f"\nDone.")
 
+    # Return per-target metrics for multi-seed aggregation.
+    metrics = {}
+    for i, name in enumerate(TARGET_NAMES):
+        preds = per_target[name]
+        truth = test_targets[:, i]
+        metrics[name] = {
+            "mae":  float(np.mean(np.abs(preds - truth))),
+            "rmse": float(np.sqrt(np.mean((preds - truth) ** 2))),
+        }
+    return metrics
+
+
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+# Multi-seed evaluation
+# ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+
+def run_multi_seed(args: argparse.Namespace) -> None:
+    """
+    Run the full training pipeline for seeds 0 … args.multi_seed-1.
+    Each seed controls: dataset generation, state-level split, model init,
+    and all training randomness.  Results are collected and summarised.
+    """
+    import copy
+    n_seeds = args.multi_seed
+    all_metrics = []   # list of dicts, one per seed
+
+    base_output_dir = args.output_dir
+
+    for seed in range(n_seeds):
+        print(f"\n{'#'*60}")
+        print(f"# Multi-seed run  seed={seed}  ({seed+1}/{n_seeds})")
+        print(f"{'#'*60}")
+
+        # Give each seed its own checkpoint directory so runs don't overwrite
+        # each other.
+        seed_args = copy.copy(args)
+        seed_args.seed = seed
+        seed_args.output_dir = os.path.join(base_output_dir, f"seed_{seed}")
+
+        metrics = train(seed_args)
+        all_metrics.append(metrics)
+
+    # ── Per-seed table ────────────────────────────────────────────────────────
+    col_w = 16
+    header = f"{'Seed':>4}  " + "  ".join(
+        f"{name+'_MAE':>{col_w}}  {name+'_RMSE':>{col_w}}"
+        for name in TARGET_NAMES
+    )
+    print(f"\n{'='*60}")
+    print(f"Multi-seed results  ({n_seeds} seeds)")
+    print(f"{'='*60}")
+    print(header)
+    print("─" * len(header))
+    for seed, m in enumerate(all_metrics):
+        row = f"{seed:>4}  " + "  ".join(
+            f"{m[name]['mae']:>{col_w}.5f}  {m[name]['rmse']:>{col_w}.5f}"
+            for name in TARGET_NAMES
+        )
+        print(row)
+
+    # ── Aggregated mean ± std ─────────────────────────────────────────────────
+    print(f"\n{'─'*60}")
+    print(f"{'Target':<18} {'Mean MAE':>12} {'Std MAE':>12} {'Mean RMSE':>12} {'Std RMSE':>12}")
+    print(f"{'─'*60}")
+    for name in TARGET_NAMES:
+        maes  = [m[name]["mae"]  for m in all_metrics]
+        rmses = [m[name]["rmse"] for m in all_metrics]
+        print(
+            f"  {name:<16} "
+            f"{np.mean(maes):>12.5f} {np.std(maes):>12.5f} "
+            f"{np.mean(rmses):>12.5f} {np.std(rmses):>12.5f}"
+        )
+    print(f"{'─'*60}")
+
 
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
 # CLI
@@ -520,9 +597,16 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--seed", type=int, default=42)
     g.add_argument("--output-dir", type=str, default="./outputs",
                    help="Directory for checkpoints and tokenizer.")
+    g.add_argument("--multi-seed", type=int, default=0,
+                   help="If > 0, run this many seeds (0..N-1) and report mean±std. "
+                        "--seed is ignored in multi-seed mode.")
 
     return p.parse_args()
 
 
 if __name__ == "__main__":
-    train(parse_args())
+    args = parse_args()
+    if args.multi_seed > 0:
+        run_multi_seed(args)
+    else:
+        train(args)
