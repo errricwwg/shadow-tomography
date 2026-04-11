@@ -48,6 +48,9 @@ Usage
 
     # Multi-seed evaluation (runs seeds 0..4, prints mean ± std):
     python train.py --n-states 100 --n-shadows 100 --n-epochs 20 --multi-seed 5
+
+    # Aggregate K measurements per sample (tests representation hypothesis):
+    python train.py --n-states 300 --n-shadows 100 --n-epochs 20 --aggregate-k 10
 """
 
 import argparse
@@ -87,6 +90,48 @@ from shadows.model import (
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
 # Helpers
 # ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+
+def _aggregate_sequences(seqs, targets, state_ids, K, pad_id):
+    """
+    Group measurements by state, then aggregate K consecutive measurements from
+    the same state into one training sample by concatenating their PAD-stripped
+    token sequences.  Incomplete trailing windows (< K measurements) are dropped.
+
+    Parameters
+    ----------
+    seqs      : list of token-id lists (one per measurement, may be padded)
+    targets   : np.ndarray, shape (n_measurements, n_targets)
+    state_ids : array-like of int, len == len(seqs), state index per measurement
+    K         : int, aggregation window size
+    pad_id    : int, PAD token id used to strip trailing padding
+
+    Returns
+    -------
+    agg_seqs  : list of concatenated token-id lists (one per window)
+    agg_tgts  : np.ndarray, shape (n_windows, n_targets)
+    """
+    # Collect sequences (PAD-stripped) per state, preserving insertion order
+    by_state: dict = {}
+    for i, s in enumerate(state_ids):
+        stripped = [t for t in seqs[i] if t != pad_id]
+        if s not in by_state:
+            by_state[s] = {"seqs": [], "target": targets[i]}
+        by_state[s]["seqs"].append(stripped)
+
+    agg_seqs = []
+    agg_tgts = []
+    for info in by_state.values():
+        meas_seqs = info["seqs"]
+        tgt = info["target"]
+        for start in range(0, len(meas_seqs) - K + 1, K):
+            concat: list = []
+            for sq in meas_seqs[start:start + K]:
+                concat.extend(sq)
+            agg_seqs.append(concat)
+            agg_tgts.append(tgt)
+
+    return agg_seqs, np.array(agg_tgts, dtype=np.float32)
+
 
 def set_seed(seed: int) -> None:
     """Seed numpy and torch for reproducibility."""
@@ -288,6 +333,8 @@ def train(args: argparse.Namespace) -> dict:
     print(f"Targets     : {TARGET_NAMES}")
     print(f"TFIM J      : {args.tfim_J}  (ZZ coupling)")
     print(f"TFIM h      : {args.tfim_h}  (transverse field)")
+    print(f"aggregate_k : {args.aggregate_k}  "
+          f"({'aggregated' if args.aggregate_k > 1 else 'single-measurement'} mode)")
 
     # ── 1. Generate dataset ───────────────────────────────────────────────────
     collector, targets = generate_dataset(
@@ -353,11 +400,33 @@ def train(args: argparse.Namespace) -> dict:
         pin_memory=(device == "cuda"),
         num_workers=0,
     )
+
+    K = args.aggregate_k
+    if K > 1:
+        # ── Aggregated mode: K measurements per state → one sample ────────────
+        # Strip PAD from each sequence, then concatenate K sequences per window.
+        # State identity is preserved: state_of_meas maps measurement → state.
+        pad_id = tokenizer.special_tokens["PAD"]
+        tr_seqs, tr_tgts = _aggregate_sequences(
+            _select_seqs(train_mask), targets[train_mask], state_of_meas[train_mask], K, pad_id)
+        va_seqs, va_tgts = _aggregate_sequences(
+            _select_seqs(val_mask),   targets[val_mask],   state_of_meas[val_mask],   K, pad_id)
+        te_seqs, te_tgts = _aggregate_sequences(
+            _select_seqs(test_mask),  targets[test_mask],  state_of_meas[test_mask],  K, pad_id)
+        base_seq_len = tokenizer.config.max_sequence_length
+        effective_seq_len = K * base_seq_len
+    else:
+        # ── Single-measurement mode (unchanged) ────────────────────────────────
+        tr_seqs, tr_tgts = _select_seqs(train_mask), targets[train_mask]
+        va_seqs, va_tgts = _select_seqs(val_mask),   targets[val_mask]
+        te_seqs, te_tgts = _select_seqs(test_mask),  targets[test_mask]
+        effective_seq_len = tokenizer.config.max_sequence_length
+
     dm = ShadowDataModule(dm_cfg)
     dm.tokenizer = tokenizer
-    dm.train_dataset = ShadowDataset(_select_seqs(train_mask), tokenizer, targets[train_mask], dm_cfg)
-    dm.val_dataset   = ShadowDataset(_select_seqs(val_mask),   tokenizer, targets[val_mask],   dm_cfg)
-    dm.test_dataset  = ShadowDataset(_select_seqs(test_mask),  tokenizer, targets[test_mask],  dm_cfg)
+    dm.train_dataset = ShadowDataset(tr_seqs, tokenizer, tr_tgts, dm_cfg)
+    dm.val_dataset   = ShadowDataset(va_seqs, tokenizer, va_tgts, dm_cfg)
+    dm.test_dataset  = ShadowDataset(te_seqs, tokenizer, te_tgts, dm_cfg)
 
     n_train_states_test = args.n_states - n_train_s - n_val_s
     n_train = len(dm.train_dataset)
@@ -365,7 +434,8 @@ def train(args: argparse.Namespace) -> dict:
     n_test  = len(dm.test_dataset)
     print(f"\nDataset split : {n_train} train / {n_val} val / {n_test} test"
           f"  (state-level: {n_train_s} / {n_val_s} / {n_train_states_test} states)")
-    print(f"Sequence length: {tokenizer.config.max_sequence_length} tokens")
+    print(f"Sequence length: {effective_seq_len} tokens"
+          + (f"  ({K} × {tokenizer.config.max_sequence_length})" if K > 1 else ""))
 
     # ── 4. Target scaler (fit on train split only) ────────────────────────────
     # We fit the scaler on training targets only to avoid data leakage.
@@ -385,6 +455,7 @@ def train(args: argparse.Namespace) -> dict:
     model = create_model_from_tokenizer(
         tokenizer,
         n_outputs=3,
+        max_seq_len=effective_seq_len,
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
@@ -600,6 +671,13 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--multi-seed", type=int, default=0,
                    help="If > 0, run this many seeds (0..N-1) and report mean±std. "
                         "--seed is ignored in multi-seed mode.")
+    g.add_argument("--aggregate-k", type=int, default=1,
+                   dest="aggregate_k",
+                   help="Aggregate K measurements from the same state into one "
+                        "training sample by concatenating their token sequences. "
+                        "1 = single-measurement mode (default, unchanged). "
+                        "> 1 = aggregated mode; positional encoding is extended "
+                        "to K × base_seq_len automatically.")
 
     return p.parse_args()
 

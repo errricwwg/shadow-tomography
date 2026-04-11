@@ -555,6 +555,7 @@ class ShadowTrainer:
 def create_model_from_tokenizer(
     tokenizer: ShadowTokenizer,
     n_outputs: int = _N_TARGETS,
+    max_seq_len: Optional[int] = None,
     d_model: int = 128,
     n_heads: int = 4,
     n_layers: int = 4,
@@ -570,6 +571,9 @@ def create_model_from_tokenizer(
         tokenizer:     ShadowTokenizer whose vocab_size and max_seq_len are used.
         n_outputs:     Number of regression targets.  3 for the full set of
                        [magnetization, correlations, energy].
+        max_seq_len:   Override the positional-encoding length.  Pass K *
+                       tokenizer.config.max_sequence_length when aggregating K
+                       measurements per sample.  None = use tokenizer default.
         d_model:       Embedding / hidden dimension.  128 trains quickly on CPU;
                        use 256 or 512 for larger datasets.
         n_heads:       Attention heads (must divide d_model).
@@ -584,7 +588,7 @@ def create_model_from_tokenizer(
     """
     config = ShadowModelConfig(
         vocab_size=tokenizer.get_vocab_size(),
-        max_seq_len=tokenizer.config.max_sequence_length,
+        max_seq_len=max_seq_len if max_seq_len is not None else tokenizer.config.max_sequence_length,
         pad_token_id=tokenizer.special_tokens["PAD"],
         d_model=d_model,
         n_heads=n_heads,
