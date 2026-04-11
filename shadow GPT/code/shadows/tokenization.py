@@ -117,7 +117,6 @@ class ShadowTokenizer:
                 f"{config.measurement_mode!r} was given. "
                 f"Use basis_outcome or binary for clifford/custom modes."
             )
-
         self.config = config
         self.special_tokens: Dict[str, int] = dict(
             config.special_tokens if config.special_tokens is not None
