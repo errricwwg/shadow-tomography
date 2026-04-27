@@ -24,6 +24,28 @@ Data collection & processing (infrastructure):
     ShadowProcessor, process_shadow_data
     ShadowConfig, create_default_config, create_pauli_config,
     create_clifford_config, create_custom_config
+
+Natural-language interface (Step 1 — schema & registry):
+    ParsedHamiltonian, PropertyResult, ExplanationResult
+    FamilySpec, get_supported_families, get_family_spec, is_supported_family
+
+Natural-language interface (Step 2 — rule-based parser):
+    parse_hamiltonian_text
+
+Natural-language interface (Step 3 — exact inference backend):
+    evaluate_exact, parse_and_evaluate_exact
+
+Natural-language interface (Step 4 — learned ShadowGPT inference backend):
+    evaluate_with_shadowgpt, parse_and_evaluate_with_shadowgpt
+
+Natural-language interface (Step 5 — report / explanation layer):
+    make_short_summary, make_detailed_summary, make_explanation_result
+    explain_exact, explain_with_shadowgpt
+
+Natural-language interface (Step 6 — optional LLM-assisted layer):
+    LLMConfig, LLMUnavailableError
+    parse_hamiltonian_with_llm, rewrite_explanation_with_llm
+    analyze_hamiltonian_nl
 """
 
 from .config import (
@@ -55,6 +77,35 @@ from .tokenization import (
     decode_generative_outcomes,
 )
 
+from .nl_schema import ParsedHamiltonian, PropertyResult, ExplanationResult
+from .family_registry import (
+    FamilySpec,
+    get_supported_families,
+    get_family_spec,
+    is_supported_family,
+)
+from .nl_parser import parse_hamiltonian_text
+from .inference_engine import (
+    evaluate_exact,
+    parse_and_evaluate_exact,
+    evaluate_with_shadowgpt,
+    parse_and_evaluate_with_shadowgpt,
+)
+from .report_generator import (
+    make_short_summary,
+    make_detailed_summary,
+    make_explanation_result,
+    explain_exact,
+    explain_with_shadowgpt,
+)
+from .llm_interface import (
+    LLMConfig,
+    LLMUnavailableError,
+    parse_hamiltonian_with_llm,
+    rewrite_explanation_with_llm,
+    analyze_hamiltonian_nl,
+)
+
 try:
     from .datasets import GenerativeShadowDataset
     from .model import GPTConfig, ShadowGPT, create_gpt_from_tokenizer
@@ -82,6 +133,34 @@ __all__ = [
     # Processor
     "ShadowProcessor",
     "process_shadow_data",
+    # NL interface — Step 1 (schema & registry)
+    "ParsedHamiltonian",
+    "PropertyResult",
+    "ExplanationResult",
+    "FamilySpec",
+    "get_supported_families",
+    "get_family_spec",
+    "is_supported_family",
+    # NL interface — Step 2 (parser)
+    "parse_hamiltonian_text",
+    # NL interface — Step 3 (exact inference)
+    "evaluate_exact",
+    "parse_and_evaluate_exact",
+    # NL interface — Step 4 (learned ShadowGPT inference)
+    "evaluate_with_shadowgpt",
+    "parse_and_evaluate_with_shadowgpt",
+    # NL interface — Step 5 (report / explanation layer)
+    "make_short_summary",
+    "make_detailed_summary",
+    "make_explanation_result",
+    "explain_exact",
+    "explain_with_shadowgpt",
+    # NL interface — Step 6 (optional LLM-assisted layer)
+    "LLMConfig",
+    "LLMUnavailableError",
+    "parse_hamiltonian_with_llm",
+    "rewrite_explanation_with_llm",
+    "analyze_hamiltonian_nl",
     # Tokenizer
     "ShadowTokenizer",
     "TokenizationConfig",
